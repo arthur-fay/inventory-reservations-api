@@ -1,0 +1,68 @@
+name: Inventory API checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: PostgreSQL integration and concurrency tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: inventory
+          POSTGRES_PASSWORD: local-ci-only-password
+          POSTGRES_DB: inventory_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U inventory -d inventory_test"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    env:
+      INVENTORY_TEST_DATABASE_URL: postgresql+psycopg://inventory:local-ci-only-password@127.0.0.1:5432/inventory_test
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install uv==0.13.4
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run python scripts/export_openapi.py --check
+      - name: Test against migrated PostgreSQL, including real competing transactions
+        run: uv run pytest --cov=inventory_api --cov-report=term-missing --cov-report=xml
+
+  compose:
+    name: Docker Compose startup, demo and restart persistence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: docker compose config --quiet
+      - name: Build, migrate and wait for the loopback-only API
+        run: docker compose up --build --wait --wait-timeout 120
+      - name: Demonstrate reservations, rejected overselling, retries and ledger reconciliation
+        run: python3 scripts/demo.py --output /tmp/inventory-demo-result.json
+      - name: Verify product and stock survive an API restart
+        run: |
+          docker compose restart api
+          docker compose up -d --wait --wait-timeout 60
+          python3 scripts/demo.py --verify /tmp/inventory-demo-result.json
+      - name: Exercise the documented container test command
+        run: docker compose --profile test run --build --rm tests
+      - name: Logs
+        if: always()
+        run: docker compose --profile test logs --no-color
+      - name: Clean up the disposable CI demonstration
+        if: always()
+        run: docker compose --profile test down -v --remove-orphans
