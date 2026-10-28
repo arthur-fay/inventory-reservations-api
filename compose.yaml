@@ -1,0 +1,73 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: local-demo-db-password
+      POSTGRES_DB: inventory
+    volumes:
+      - inventory-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory -d inventory"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate:
+    build: .
+    image: inventory-reservations-api:local
+    command: ["alembic", "upgrade", "head"]
+    environment: &app-environment
+      INVENTORY_DATABASE_URL: postgresql+psycopg://inventory:local-demo-db-password@db:5432/inventory
+      INVENTORY_API_KEY: ${INVENTORY_API_KEY:-local-demo-key-not-for-public-deployment}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    image: inventory-reservations-api:local
+    environment: *app-environment
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  db-test:
+    profiles: [test]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: local-test-db-password
+      POSTGRES_DB: inventory_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory -d inventory_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  tests:
+    profiles: [test]
+    build:
+      context: .
+      target: test
+    environment:
+      INVENTORY_TEST_DATABASE_URL: postgresql+psycopg://inventory:local-test-db-password@db-test:5432/inventory_test
+    depends_on:
+      db-test:
+        condition: service_healthy
+
+volumes:
+  inventory-data:
